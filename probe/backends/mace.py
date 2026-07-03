@@ -109,27 +109,20 @@ def _get_energy(atoms):
         return None
 
 
-def _get_mace_energy(atoms):
-    val = atoms.info.get('MACE_energy')
-    return float(val) if val is not None else None
-
-
 def frame_dict_to_atoms(frame: dict):
     """Convert a probe.io_extxyz frame dict to an ASE Atoms object."""
     from ase import Atoms
     atoms = Atoms(symbols=frame['symbols'], positions=frame['positions'])
-    atoms.info['energy'] = frame['true_energy']
-    if frame['mace_energy'] is not None:
-        atoms.info['MACE_energy'] = frame['mace_energy']
+    if frame['true_energy'] is not None:
+        atoms.info['energy'] = frame['true_energy']
     if frame.get('config_type'):
         atoms.info['config_type'] = frame['config_type']
     atoms.arrays['forces'] = frame['true_forces']
-    atoms.arrays['MACE_forces'] = frame['mace_forces']
     return atoms
 
 
 def load_probe_extxyz_list(xyz_path: str, max_structures: int = None):
-    """Load structures using the PROBE extxyz parser (handles MACE_* fields)."""
+    """Load structures with reference energy/forces via probe.io_extxyz."""
     from ..io_extxyz import iter_probe_extxyz
     atoms_list = []
     for frame in iter_probe_extxyz(xyz_path, max_structures=max_structures):
@@ -154,15 +147,8 @@ def atoms_to_atomic_data(atoms, z_table, r_max, heads=None):
         config_type=atoms.info.get('config_type', 'Default'),
         head='Default',
     )
-    data = AtomicData.from_config(config, z_table=z_table,
+    return AtomicData.from_config(config, z_table=z_table,
                                   cutoff=r_max, heads=heads)
-    mace_e = _get_mace_energy(atoms)
-    if mace_e is not None:
-        data.mace_energy = torch.tensor(mace_e, dtype=torch.float64)
-    if 'MACE_forces' in atoms.arrays:
-        data.mace_forces = torch.tensor(atoms.arrays['MACE_forces'],
-                                        dtype=torch.float64)
-    return data
 
 
 def load_xyz_dataloader(xyz_path: str, z_table, r_max: float,
@@ -188,7 +174,8 @@ def train_val_split_loader(xyz_path: str, z_table, r_max: float,
                            seed: int = 42, use_probe_extxyz: bool = True):
     """Load XYZ and return (train_loader, val_loader).
 
-    Uses probe.io_extxyz for files with precomputed MACE_energy / MACE_forces.
+    Uses probe.io_extxyz when ASE cannot parse reference energy/forces
+  from complex extxyz info lines. MACE predictions are always computed live.
     """
     import numpy as np
     from tqdm.auto import tqdm
@@ -218,15 +205,33 @@ def train_val_split_loader(xyz_path: str, z_table, r_max: float,
     return train_loader, val_loader
 
 
+def load_extxyz_dataloader(xyz_path: str, z_table, r_max: float,
+                           batch_size: int, shuffle: bool = False,
+                           max_structures: int = None):
+    """Load extxyz (reference labels) into a PyG DataLoader."""
+    from tqdm.auto import tqdm
+    atoms_list = load_probe_extxyz_list(xyz_path, max_structures=max_structures)
+    dataset = []
+    for atoms in tqdm(atoms_list, desc='Converting', leave=False):
+        try:
+            dataset.append(atoms_to_atomic_data(atoms, z_table, r_max))
+        except Exception:
+            pass
+    return torch_geometric.DataLoader(dataset, batch_size=batch_size,
+                                      shuffle=shuffle, drop_last=False)
+
+
 # ---------------------------------------------------------------------------
 # Batch processing  (PyG-style flat atom tensors → [B, N_max, D] padded)
 # ---------------------------------------------------------------------------
 
 def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
-                       compute_force: bool = False,
-                       use_precomputed_mace: bool = False):
+                       compute_force: bool = False):
     """
     Run MACE on a PyG batch and return PROBE-compatible padded tensors.
+
+    Predicted energy/forces come from the live MACE forward pass.
+    Reference energy/forces come from the dataset (extxyz).
 
     Returns:
         atom_feats:   [B, N_max, feat_dim]
@@ -237,7 +242,6 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
         pred_forces:  [B, N_max, 3]  (only if compute_force=True)
         true_forces:  [B, N_max, 3]  (only if compute_force=True)
     """
-    # Cast batch floats to float32 to match MACE model
     batch = batch.to(device)
     for key in batch.keys:
         attr = getattr(batch, key, None)
@@ -246,11 +250,9 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
 
     mace_out, node_feats_flat = extractor(batch, compute_force=compute_force)
 
-    ptr         = batch.ptr                         # [B+1]
-    pred_energy = mace_out['energy']                # [B]
-    true_energy = batch.energy                      # [B]
-    if use_precomputed_mace and hasattr(batch, 'mace_energy'):
-        pred_energy = batch.mace_energy
+    ptr         = batch.ptr
+    pred_energy = mace_out['energy']
+    true_energy = batch.energy
     B           = ptr.shape[0] - 1
     D           = node_feats_flat.shape[1]
     sizes       = (ptr[1:] - ptr[:-1]).tolist()
@@ -259,9 +261,8 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
     atom_feats = torch.zeros(B, N_max, D, device=device)
     atom_mask  = torch.zeros(B, N_max, dtype=torch.bool, device=device)
     pred_forces = true_forces = None
-    if compute_force or use_precomputed_mace:
-        pred_forces_flat = (batch.mace_forces if use_precomputed_mace and
-                            hasattr(batch, 'mace_forces') else mace_out['forces'])
+    if compute_force:
+        pred_forces_flat = mace_out['forces']
         true_forces_flat = batch.forces
         pred_forces = torch.zeros(B, N_max, 3, device=device)
         true_forces = torch.zeros(B, N_max, 3, device=device)
@@ -271,29 +272,25 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
         n = e - s
         atom_feats[i, :n] = node_feats_flat[s:e]
         atom_mask[i, :n]  = True
-        if compute_force or use_precomputed_mace:
+        if compute_force:
             pred_forces[i, :n] = pred_forces_flat[s:e]
             true_forces[i, :n] = true_forces_flat[s:e]
 
     n_atoms = atom_mask.sum(dim=1).float()
-    if compute_force or use_precomputed_mace:
+    if compute_force:
         return (atom_feats, atom_mask, pred_energy, true_energy,
                 pred_forces, true_forces, n_atoms)
     return atom_feats, atom_mask, pred_energy, true_energy, n_atoms
 
 
 def process_batch_mace_multitask(batch, device: str,
-                                 extractor: MACEFeatureExtractor,
-                                 use_precomputed_mace: bool = False):
-    """Multitask batch processing with predicted and reference forces."""
-    return process_batch_mace(batch, device, extractor,
-                              compute_force=not use_precomputed_mace,
-                              use_precomputed_mace=use_precomputed_mace)
+                                 extractor: MACEFeatureExtractor):
+    """Multitask batch processing: live MACE energy + forces."""
+    return process_batch_mace(batch, device, extractor, compute_force=True)
 
 
 def scan_force_error_boundaries(train_loader, device, extractor,
-                                percentile: float = 50,
-                                use_precomputed_mace: bool = False):
+                                percentile: float = 50):
     """Scan training set and return (boundary_atom, boundary_mol) in eV/Å."""
     from ..labels import (atom_force_component_mae, structure_mean_force_error,
                           compute_percentile_boundary)
@@ -301,9 +298,7 @@ def scan_force_error_boundaries(train_loader, device, extractor,
     atom_errors, struct_errors = [], []
     for batch in train_loader:
         (_, atom_mask, _, _, pred_forces, true_forces, _) = \
-            process_batch_mace_multitask(
-                batch, device, extractor,
-                use_precomputed_mace=use_precomputed_mace)
+            process_batch_mace_multitask(batch, device, extractor)
         atom_err = atom_force_component_mae(pred_forces, true_forces)
         struct_err = structure_mean_force_error(atom_err, atom_mask)
         mask = atom_mask.bool()
