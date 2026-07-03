@@ -179,7 +179,8 @@ def train_val_split_loader(xyz_path: str, z_table, r_max: float,
 # Batch processing  (PyG-style flat atom tensors → [B, N_max, D] padded)
 # ---------------------------------------------------------------------------
 
-def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor):
+def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
+                       compute_force: bool = False):
     """
     Run MACE on a PyG batch and return PROBE-compatible padded tensors.
 
@@ -189,6 +190,8 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor):
         pred_energy:  [B]
         true_energy:  [B]
         n_atoms:      [B]
+        pred_forces:  [B, N_max, 3]  (only if compute_force=True)
+        true_forces:  [B, N_max, 3]  (only if compute_force=True)
     """
     # Cast batch floats to float32 to match MACE model
     batch = batch.to(device)
@@ -197,7 +200,7 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor):
         if isinstance(attr, torch.Tensor) and attr.is_floating_point():
             setattr(batch, key, attr.float())
 
-    mace_out, node_feats_flat = extractor(batch)  # node_feats: [n_atoms_total, D]
+    mace_out, node_feats_flat = extractor(batch, compute_force=compute_force)
 
     ptr         = batch.ptr                         # [B+1]
     pred_energy = mace_out['energy']                # [B]
@@ -209,11 +212,53 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor):
 
     atom_feats = torch.zeros(B, N_max, D, device=device)
     atom_mask  = torch.zeros(B, N_max, dtype=torch.bool, device=device)
+    pred_forces = true_forces = None
+    if compute_force:
+        pred_forces_flat = mace_out['forces']
+        true_forces_flat = batch.forces
+        pred_forces = torch.zeros(B, N_max, 3, device=device)
+        true_forces = torch.zeros(B, N_max, 3, device=device)
+
     for i in range(B):
         s, e = ptr[i].item(), ptr[i + 1].item()
         n = e - s
         atom_feats[i, :n] = node_feats_flat[s:e]
         atom_mask[i, :n]  = True
+        if compute_force:
+            pred_forces[i, :n] = pred_forces_flat[s:e]
+            true_forces[i, :n] = true_forces_flat[s:e]
 
     n_atoms = atom_mask.sum(dim=1).float()
+    if compute_force:
+        return (atom_feats, atom_mask, pred_energy, true_energy,
+                pred_forces, true_forces, n_atoms)
     return atom_feats, atom_mask, pred_energy, true_energy, n_atoms
+
+
+def process_batch_mace_multitask(batch, device: str,
+                                 extractor: MACEFeatureExtractor):
+    """Multitask batch processing with predicted and reference forces."""
+    return process_batch_mace(batch, device, extractor, compute_force=True)
+
+
+def scan_force_error_boundaries(train_loader, device, extractor,
+                                percentile: float = 50):
+    """Scan training set and return (boundary_atom, boundary_mol) in eV/Å."""
+    from ..labels import (atom_force_component_mae, structure_mean_force_error,
+                          compute_percentile_boundary)
+
+    atom_errors, struct_errors = [], []
+    for batch in train_loader:
+        (_, atom_mask, _, _, pred_forces, true_forces, _) = \
+            process_batch_mace_multitask(batch, device, extractor)
+        atom_err = atom_force_component_mae(pred_forces, true_forces)
+        struct_err = structure_mean_force_error(atom_err, atom_mask)
+        mask = atom_mask.bool()
+        atom_errors.extend(atom_err[mask].cpu().numpy().tolist())
+        struct_errors.extend(struct_err.cpu().numpy().tolist())
+
+    boundary_atom = compute_percentile_boundary(
+        np.array(atom_errors), percentile, unit='eV/Å (per atom)')
+    boundary_mol = compute_percentile_boundary(
+        np.array(struct_errors), percentile, unit='eV/Å (per structure mean)')
+    return boundary_atom, boundary_mol

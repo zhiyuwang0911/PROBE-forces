@@ -227,3 +227,92 @@ class PROBEModel(nn.Module):
     def get_attention_weights(self) -> torch.Tensor:
         """Returns [B, H, N, N] attention weights from the last forward pass."""
         return self._last_attention_weights
+
+
+def aggregate_atom_force_logits(logits_atom: torch.Tensor,
+                                atom_mask: torch.Tensor) -> torch.Tensor:
+    """Mean-aggregate per-atom force logits to structure-level logits.
+
+    Takes the masked mean of P(unreliable) over atoms and converts back to
+  2-class log-probabilities for cross-entropy.
+
+    Args:
+        logits_atom: [B, N, 2]
+        atom_mask:   [B, N] bool
+    Returns:
+        logits_mol: [B, 2]
+    """
+    probs = F.softmax(logits_atom, dim=-1)
+    p_unrel = probs[..., 1]
+    mask_f = atom_mask.float()
+    p_mol = (p_unrel * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+    p_mol = p_mol.clamp(1e-6, 1 - 1e-6)
+    return torch.stack([torch.log(1 - p_mol), torch.log(p_mol)], dim=-1)
+
+
+class MultitaskPROBEModel(PROBEModel):
+    """
+    Multitask PROBE: energy reliability (structure) + force reliability
+    (per-atom + structure via mean aggregation of atom predictions).
+
+    Architecture:
+        shared atom encoder + self-attention
+        ├─ energy branch:  mean/max pool + energy + N_atoms → energy classifier
+        ├─ atom force head: per-atom MLP → [B, N, 2]
+        └─ structure force: mean aggregate atom logits → [B, 2]  (no extra head)
+    """
+
+    def __init__(
+        self,
+        backbone_dim: int,
+        n_classes: int = 2,
+        atom_encoder_hidden: list = [256, 128],
+        atom_encoder_output_dim: int = 256,
+        mol_attention_heads: int = 32,
+        classifier_hidden: list = [256, 128, 32],
+        atom_force_head_hidden: list = [128, 32],
+        dropout: float = 0.1,
+    ):
+        super().__init__(
+            backbone_dim=backbone_dim,
+            n_classes=n_classes,
+            atom_encoder_hidden=atom_encoder_hidden,
+            atom_encoder_output_dim=atom_encoder_output_dim,
+            mol_attention_heads=mol_attention_heads,
+            classifier_hidden=classifier_hidden,
+            dropout=dropout,
+        )
+        self.energy_classifier = self.classifier
+        self.atom_force_head = build_mlp(
+            atom_encoder_output_dim, atom_force_head_hidden, n_classes,
+            dropout, use_layernorm=True,
+        )
+
+    def forward(self, atom_feats: torch.Tensor, atom_mask: torch.Tensor,
+                energy: torch.Tensor = None,
+                return_attention: bool = False,
+                return_embeddings: bool = False):
+        """
+        Returns:
+            logits_energy:      [B, 2]
+            logits_force_atom:  [B, N, 2]
+            logits_force_mol:   [B, 2]  (mean-aggregated from atom logits)
+        """
+        attended = self.encode_atoms(atom_feats, atom_mask)
+        logits_energy = self.pool_and_classify(attended, atom_mask, energy)
+        logits_force_atom = self.atom_force_head(attended)
+        logits_force_mol = aggregate_atom_force_logits(logits_force_atom, atom_mask)
+
+        if return_attention:
+            if return_embeddings:
+                _, emb = self.pool_and_classify(
+                    attended, atom_mask, energy, return_embeddings=True)
+                return (logits_energy, logits_force_atom, logits_force_mol,
+                        self._last_attention_weights, emb)
+            return (logits_energy, logits_force_atom, logits_force_mol,
+                    self._last_attention_weights)
+        if return_embeddings:
+            _, emb = self.pool_and_classify(
+                attended, atom_mask, energy, return_embeddings=True)
+            return logits_energy, logits_force_atom, logits_force_mol, emb
+        return logits_energy, logits_force_atom, logits_force_mol
