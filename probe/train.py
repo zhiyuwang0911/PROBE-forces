@@ -413,7 +413,7 @@ def evaluate_multitask(model, process_batch_fn, dataloader,
     model.eval()
     tasks = ('energy', 'force_atom', 'force_mol')
     store = {t: {'logits': [], 'targets': [], 'errors': []} for t in tasks}
-    store['force_atom']['masks'] = []
+    store['force_atom']['batch_losses'] = []
     all_n_atoms = []
 
     for batch in tqdm(dataloader, desc='Evaluating', leave=False):
@@ -446,10 +446,13 @@ def evaluate_multitask(model, process_batch_fn, dataloader,
         store['force_mol']['targets'].append(target_fm.cpu())
         store['force_mol']['errors'].append(err_fm.cpu())
 
-        store['force_atom']['logits'].append(logits_fa.cpu())
-        store['force_atom']['targets'].append(target_fa.cpu())
-        store['force_atom']['errors'].append(err_fa.cpu())
-        store['force_atom']['masks'].append(atom_mask.cpu())
+        # Flatten valid atoms — N_max varies across batches so [B, N, *] cannot be cat'd.
+        mask_cpu = atom_mask.cpu()
+        store['force_atom']['logits'].append(logits_fa.cpu()[mask_cpu])
+        store['force_atom']['targets'].append(target_fa.cpu()[mask_cpu])
+        store['force_atom']['errors'].append(err_fa.cpu()[mask_cpu])
+        store['force_atom']['batch_losses'].append(
+            atom_force_loss_fn(logits_fa, target_fa, atom_mask, n_atoms_v).item())
         all_n_atoms.append(n_atoms_v.cpu())
 
     all_n_atoms = torch.cat(all_n_atoms)
@@ -457,19 +460,18 @@ def evaluate_multitask(model, process_batch_fn, dataloader,
     loss_sum = 0.0
 
     for task in tasks:
-        logits = torch.cat(store[task]['logits'])
-        targets = torch.cat(store[task]['targets'])
-        errors = torch.cat(store[task]['errors'])
-
         if task == 'force_atom':
-            masks = torch.cat(store['force_atom']['masks'])
-            preds = logits.argmax(dim=-1)
+            logits = torch.cat(store['force_atom']['logits'], dim=0)
+            targets = torch.cat(store['force_atom']['targets'], dim=0)
+            errors = torch.cat(store['force_atom']['errors'], dim=0)
             probs = F.softmax(logits, dim=-1)
-            cm = confusion_matrix_torch(
-                preds[masks], targets[masks], n_classes)
-            task_loss = atom_force_loss_fn(
-                logits, targets, masks, all_n_atoms).item()
+            preds = probs.argmax(dim=-1)
+            cm = confusion_matrix_torch(preds, targets, n_classes)
+            task_loss = float(np.mean(store['force_atom']['batch_losses']))
         else:
+            logits = torch.cat(store[task]['logits'])
+            targets = torch.cat(store[task]['targets'])
+            errors = torch.cat(store[task]['errors'])
             probs = F.softmax(logits, dim=-1)
             preds = probs.argmax(dim=-1)
             cm = confusion_matrix_torch(preds, targets, n_classes)
