@@ -1,6 +1,18 @@
 MIT License
 
 Copyright (c) 2026 Isayev Lab, Carnegie Mellon University
+Copyright (c) 2026 Zhiyu Wang
+
+This repository is based on PROBE (Post-hoc Reliability frOm Backbone Embeddings),
+the original software accompanying:
+
+  Knowing when to trust machine-learned interatomic potentials
+  Shams Mehdi, Ilkwon Cho, Olexandr Isayev
+
+Modifications and extensions in this repository — including multitask energy/force
+reliability classification — were made by Zhiyu Wang. The original PROBE code
+and architecture remain the property of their respective authors; see copyright
+notices above.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

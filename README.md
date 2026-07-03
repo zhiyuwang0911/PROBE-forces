@@ -171,4 +171,8 @@ with torch.no_grad():
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
+
+This repository extends the original [PROBE](https://github.com/isayevlab/PROBE) code
+(Isayev Lab, Carnegie Mellon University). Multitask energy/force modifications are
+Copyright (c) 2026 Zhiyu Wang.
