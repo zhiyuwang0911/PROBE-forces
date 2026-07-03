@@ -49,6 +49,9 @@ CONFIG = {
     'lambda_force_atom':   1.0,
     'lambda_force_mol':    1.0,
 
+    # Use MACE_energy / MACE_forces from extxyz when present (no force autograd)
+    'use_precomputed_mace': True,
+
     # Training
     'lr':                5e-5,
     'weight_decay':      1e-4,
@@ -91,7 +94,9 @@ def main():
     print("Computing energy error distribution on training set...")
     errors_kcal = []
     for batch in tqdm(train_loader, desc='Scanning energy errors'):
-        _, _, pred_e, true_e, _ = process_batch_mace(batch, device, extractor)
+        _, _, pred_e, true_e, _ = process_batch_mace(
+            batch, device, extractor,
+            use_precomputed_mace=CONFIG['use_precomputed_mace'])
         err = torch.abs(true_e - pred_e)
         valid = ~torch.isnan(err)
         errors_kcal.extend((err[valid].cpu().numpy() * CONFIG['ev_to_kcalmol']).tolist())
@@ -104,7 +109,8 @@ def main():
     # 4. Force boundaries from training set (per-atom + mean-atom structure)
     print("Computing force error distribution on training set...")
     boundary_f_atom, boundary_f_mol = scan_force_error_boundaries(
-        train_loader, device, extractor, CONFIG['error_boundary_percentile'])
+        train_loader, device, extractor, CONFIG['error_boundary_percentile'],
+        use_precomputed_mace=CONFIG['use_precomputed_mace'])
     error_bins_f_atom = torch.tensor([0.0, boundary_f_atom], device=device)
     error_bins_f_mol  = torch.tensor([0.0, boundary_f_mol], device=device)
 
@@ -123,7 +129,8 @@ def main():
     print(f"Multitask PROBE parameters: {total_params:,}")
 
     # 6. Train
-    process_fn = lambda batch, dev: process_batch_mace_multitask(batch, dev, extractor)
+    process_fn = lambda batch, dev: process_batch_mace_multitask(
+        batch, dev, extractor, use_precomputed_mace=CONFIG['use_precomputed_mace'])
     history = run_multitask_training(
         model=model,
         process_batch_fn=process_fn,

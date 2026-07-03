@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+probe_outputs/
+probe_mace_multitask_outputs/
+probe_data_check/
+*.pt
