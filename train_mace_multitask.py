@@ -9,7 +9,10 @@ MACE energy/forces are computed via live forward pass (not read from extxyz).
 
 Edit the CONFIG block below, then run:
     python train_mace_multitask.py
+    python train_mace_multitask.py --enable-cueq   # NVIDIA CUDA acceleration
 """
+
+import argparse
 
 import numpy as np
 import torch
@@ -37,6 +40,7 @@ CONFIG = {
 
     # Device
     'device':            'cuda' if torch.cuda.is_available() else 'cpu',
+    'enable_cueq':       False,   # True: NVIDIA cuEquivariance (CUDA + extra pkgs)
     'ev_to_kcalmol':     23.06,
 
     # Data
@@ -74,11 +78,25 @@ CONFIG = {
 }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Train multitask PROBE on MACE-OFF23')
+    parser.add_argument(
+        '--enable-cueq', action='store_true',
+        help='Enable NVIDIA cuEquivariance CUDA acceleration for MACE '
+             '(overrides CONFIG enable_cueq)',
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     device = CONFIG['device']
+    enable_cueq = CONFIG['enable_cueq'] or args.enable_cueq
 
     # 1. Load frozen MACE backbone
-    extractor = load_mace(CONFIG['mace_model_path'], device)
+    extractor = load_mace(
+        CONFIG['mace_model_path'], device, enable_cueq=enable_cueq)
     z_table   = get_z_table(extractor)
     r_max     = float(extractor.mace_model.r_max)
 

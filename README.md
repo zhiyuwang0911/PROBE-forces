@@ -46,6 +46,14 @@ conda env create -f environment_mace.yml
 conda activate probe_mace
 ```
 
+**For MACE + cuEquivariance (CUDA acceleration, PyTorch ≥ 2.4):**
+```bash
+module load cuda/12.1.1   # on HPC clusters, before conda create
+conda env create -f environment_mace_cueq.yml
+conda activate probe_mace_cueq
+python train_mace_multitask.py --enable-cueq
+```
+
 **For AIMNet2:**
 ```bash
 conda env create -f environment_aimnet2.yml

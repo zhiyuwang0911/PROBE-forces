@@ -1,0 +1,37 @@
+# PROBE + MACE with NVIDIA cuEquivariance CUDA acceleration.
+#
+# Requires a CUDA GPU. PyTorch must be >= 2.4 for cuequivariance-torch.
+#
+# Create:
+#   conda env create -f environment_mace_cueq.yml
+#   conda activate probe_mace_cueq
+#
+# On clusters, load CUDA before creating the env, e.g.:
+#   module load cuda/12.1.1
+#
+# For CUDA 11 systems, change pytorch-cuda to 11.8 and replace
+# cuequivariance-ops-torch-cu12 with cuequivariance-ops-torch-cu11 below.
+#
+# Run multitask training with acceleration:
+#   python train_mace_multitask.py --enable-cueq
+
+name: probe_mace_cueq
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.4
+  - pytorch-cuda=12.1
+  - numpy
+  - pip
+  - pip:
+    - tqdm
+    - ase
+    - e3nn
+    - mace-torch
+    - cuequivariance
+    - cuequivariance-torch
+    - cuequivariance-ops-torch-cu12

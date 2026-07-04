@@ -32,6 +32,13 @@ try:
 except ImportError:
     _MACE_AVAILABLE = False
 
+try:
+    from mace.cli.convert_e3nn_cueq import run as convert_e3nn_to_cueq
+    _CUEQ_AVAILABLE = True
+except ImportError:
+    _CUEQ_AVAILABLE = False
+    convert_e3nn_to_cueq = None
+
 
 # ---------------------------------------------------------------------------
 # Feature extractor (forward hook)
@@ -73,17 +80,43 @@ class MACEFeatureExtractor(nn.Module):
 # Load backbone
 # ---------------------------------------------------------------------------
 
-def load_mace(model_path: str, device: str = 'cuda') -> MACEFeatureExtractor:
-    """Load a frozen MACE model and return a MACEFeatureExtractor."""
+def load_mace(model_path: str, device: str = 'cuda',
+              enable_cueq: bool = False) -> MACEFeatureExtractor:
+    """Load a frozen MACE model and return a MACEFeatureExtractor.
+
+    Args:
+        model_path: Path to a MACE .model checkpoint.
+        device: 'cuda' or 'cpu'.
+        enable_cueq: If True, convert the model to NVIDIA cuEquivariance
+            CUDA kernels (requires cuequivariance packages and CUDA).
+    """
     os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
     mace_model = torch.load(model_path, map_location=device)
+
+    if enable_cueq:
+        if not str(device).startswith('cuda'):
+            raise ValueError(
+                "enable_cueq=True requires a CUDA device "
+                f"(got device={device!r}).")
+        if not _CUEQ_AVAILABLE:
+            raise ImportError(
+                "enable_cueq=True but cuEquivariance is not installed. "
+                "Install cuequivariance, cuequivariance-torch, and "
+                "cuequivariance-ops-torch-cu12 — see "
+                "https://mace-docs.readthedocs.io/en/latest/guide/cuda_acceleration.html"
+            )
+        print("Converting MACE model to cuEquivariance (CUDA acceleration)...")
+        mace_model = convert_e3nn_to_cueq(
+            mace_model, device=device, return_model=True)
+
     mace_model.to(device).eval().float()   # cast to float32
     for p in mace_model.parameters():
         p.requires_grad = False
     extractor = MACEFeatureExtractor(mace_model)
+    cueq_status = 'on' if enable_cueq else 'off'
     print(f"r_max={mace_model.r_max:.2f}, "
           f"num_interactions={mace_model.num_interactions.item()}, "
-          f"feat_dim={extractor.feat_dim}")
+          f"feat_dim={extractor.feat_dim}, cueq={cueq_status}")
     return extractor
 
 
