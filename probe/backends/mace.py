@@ -67,11 +67,20 @@ class MACEFeatureExtractor(nn.Module):
     def _hook(self, module, input, output):
         self._last_feats = output
 
-    @torch.no_grad()
     def forward(self, data, compute_force: bool = False):
-        """Returns (mace_output_dict, node_feats [n_atoms, feat_dim])."""
+        """Returns (mace_output_dict, node_feats [n_atoms, feat_dim]).
+
+        Force prediction uses autograd w.r.t. positions and must run outside
+        torch.no_grad(). Backbone weights stay frozen (requires_grad=False).
+        """
         self._last_feats = None
-        out = self.mace_model(data, compute_force=compute_force)
+        if compute_force:
+            if hasattr(data, 'positions') and data.positions is not None:
+                data.positions.requires_grad_(True)
+            out = self.mace_model(data, compute_force=True)
+        else:
+            with torch.no_grad():
+                out = self.mace_model(data, compute_force=False)
         assert self._last_feats is not None, "Forward hook did not fire."
         return out, self._last_feats
 
@@ -282,9 +291,10 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
             setattr(batch, key, attr.float())
 
     mace_out, node_feats_flat = extractor(batch, compute_force=compute_force)
+    node_feats_flat = node_feats_flat.detach()
 
     ptr         = batch.ptr
-    pred_energy = mace_out['energy']
+    pred_energy = mace_out['energy'].detach()
     true_energy = batch.energy
     B           = ptr.shape[0] - 1
     D           = node_feats_flat.shape[1]
@@ -295,7 +305,7 @@ def process_batch_mace(batch, device: str, extractor: MACEFeatureExtractor,
     atom_mask  = torch.zeros(B, N_max, dtype=torch.bool, device=device)
     pred_forces = true_forces = None
     if compute_force:
-        pred_forces_flat = mace_out['forces']
+        pred_forces_flat = mace_out['forces'].detach()
         true_forces_flat = batch.forces
         pred_forces = torch.zeros(B, N_max, 3, device=device)
         true_forces = torch.zeros(B, N_max, 3, device=device)
