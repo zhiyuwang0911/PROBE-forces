@@ -75,9 +75,11 @@ class MACEFeatureExtractor(nn.Module):
         """
         self._last_feats = None
         if compute_force:
-            if hasattr(data, 'positions') and data.positions is not None:
-                data.positions.requires_grad_(True)
-            out = self.mace_model(data, compute_force=True)
+            # enable_grad() overrides an outer torch.no_grad() (e.g. validation).
+            with torch.enable_grad():
+                if hasattr(data, 'positions') and data.positions is not None:
+                    data.positions = data.positions.detach().requires_grad_(True)
+                out = self.mace_model(data, compute_force=True)
         else:
             with torch.no_grad():
                 out = self.mace_model(data, compute_force=False)
