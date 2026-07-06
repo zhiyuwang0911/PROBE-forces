@@ -408,6 +408,9 @@ def train_epoch_multitask(model, process_batch_fn, dataloader, optimizer,
 def evaluate_multitask(model, process_batch_fn, dataloader,
                        error_bins_e, error_bins_f_atom, error_bins_f_mol,
                        device, n_classes: int = 2,
+                       lambda_energy: float = 1.0,
+                       lambda_force_atom: float = 1.0,
+                       lambda_force_mol: float = 1.0,
                        high_conf_cutoffs: Optional[Dict] = None) -> dict:
     """Evaluate multitask model; returns per-task metrics."""
     model.eval()
@@ -458,6 +461,11 @@ def evaluate_multitask(model, process_batch_fn, dataloader,
     all_n_atoms = torch.cat(all_n_atoms)
     results = {'per_task': {}, 'loss': 0.0}
     loss_sum = 0.0
+    task_lambdas = {
+        'energy': lambda_energy,
+        'force_atom': lambda_force_atom,
+        'force_mol': lambda_force_mol,
+    }
 
     for task in tasks:
         if task == 'force_atom':
@@ -491,9 +499,9 @@ def evaluate_multitask(model, process_batch_fn, dataloader,
                 probs, preds, targets, high_conf_cutoffs, n_classes)
 
         results['per_task'][task] = metrics
-        loss_sum += task_loss
+        loss_sum += task_lambdas[task] * task_loss
 
-    results['loss'] = loss_sum / len(tasks)
+    results['loss'] = loss_sum
     results['accuracy'] = results['per_task']['energy']['accuracy']
     results['mcc'] = results['per_task']['energy']['mcc']
     results['f1'] = results['per_task']['energy']['f1']
@@ -540,7 +548,11 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         val_results = evaluate_multitask(
             model, process_batch_fn, val_loader,
             error_bins_e, error_bins_f_atom, error_bins_f_mol, device,
-            n_classes=model.n_classes, high_conf_cutoffs=high_conf_cutoffs,
+            n_classes=model.n_classes,
+            lambda_energy=lambda_energy,
+            lambda_force_atom=lambda_force_atom,
+            lambda_force_mol=lambda_force_mol,
+            high_conf_cutoffs=high_conf_cutoffs,
         )
         val_loss = val_results['loss']
         scheduler.step(val_loss)
