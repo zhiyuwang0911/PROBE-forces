@@ -31,7 +31,8 @@ PROBE/
 │       ├── aimnet2.py      # AIMNet2 data loading & batch processing
 │       └── mace.py         # MACE data loading & batch processing
 ├── train_aimnet2.py        # runnable training script for AIMNet2
-├── train_mace.py           # runnable training script for MACE
+├── train_mace.py           # runnable training script for MACE (energy only)
+├── train_mace_multitask.py # runnable training script for MACE (energy + force)
 ├── environment_aimnet2.yml
 └── environment_mace.yml
 ```
@@ -87,6 +88,53 @@ CONFIG = {
 ```bash
 python train_mace.py
 ```
+
+### Multitask on MACE-OFF23 (energy + force)
+
+`train_mace_multitask.py` extends PROBE to classify **energy reliability**,
+**per-atom force reliability**, and **structure-level force reliability**
+(structure force predictions are mean-aggregated from per-atom logits; no extra
+head). MACE energy and forces are computed via a live forward pass.
+
+1. Edit the `CONFIG` block in `train_mace_multitask.py` (paths, batch size,
+   architecture, etc.).
+
+2. Run:
+
+```bash
+python train_mace_multitask.py
+```
+
+**CUDA acceleration (optional):**
+
+```bash
+python train_mace_multitask.py --enable-cueq
+```
+
+**Loss weights (optional):** the total objective is a weighted sum of three
+cross-entropy terms — energy (`L_E`), per-atom force (`L_Fa`), and
+structure-level force (`L_Fs`). Set weights via CLI (overrides `CONFIG`) or in
+`CONFIG`:
+
+```bash
+python train_mace_multitask.py \
+  --lambda-energy 1.0 \
+  --lambda-force-atom 1.0 \
+  --lambda-force-mol 0.3
+```
+
+| Flag | `CONFIG` key | Default | Task |
+|------|----------------|---------|------|
+| `--lambda-energy` | `lambda_energy` | `1.0` | Structure energy reliability |
+| `--lambda-force-atom` | `lambda_force_atom` | `1.0` | Per-atom force reliability |
+| `--lambda-force-mol` | `lambda_force_mol` | `1.0` | Structure force reliability (derived from atom logits) |
+
+`L_Fs` is computed from the same per-atom force head as `L_Fa`, so lowering
+`lambda_force_mol` (e.g. `0.3`) is often reasonable when the structure-level
+force task is easier or redundant. Train and validation loss use the same
+weighted sum for direct comparison.
+
+The best checkpoint is saved to `output_dir/best_multitask_model_<timestamp>.pt`.
 
 ### On AIMNet2
 

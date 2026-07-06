@@ -10,6 +10,7 @@ MACE energy/forces are computed via live forward pass (not read from extxyz).
 Edit the CONFIG block below, then run:
     python train_mace_multitask.py
     python train_mace_multitask.py --enable-cueq   # NVIDIA CUDA acceleration
+    python train_mace_multitask.py --lambda-energy 1.0 --lambda-force-atom 1.0 --lambda-force-mol 0.3
 """
 
 import argparse
@@ -86,13 +87,43 @@ def parse_args():
         help='Enable NVIDIA cuEquivariance CUDA acceleration for MACE '
              '(overrides CONFIG enable_cueq)',
     )
+    parser.add_argument(
+        '--lambda-energy', type=float, default=None,
+        help='Loss weight for energy reliability (default: CONFIG lambda_energy)',
+    )
+    parser.add_argument(
+        '--lambda-force-atom', type=float, default=None,
+        help='Loss weight for per-atom force reliability '
+             '(default: CONFIG lambda_force_atom)',
+    )
+    parser.add_argument(
+        '--lambda-force-mol', type=float, default=None,
+        help='Loss weight for structure-level force reliability '
+             '(default: CONFIG lambda_force_mol)',
+    )
     return parser.parse_args()
+
+
+def _resolve_lambda(cli_value, config_key: str) -> float:
+    """CLI value overrides CONFIG when provided."""
+    if cli_value is not None:
+        return cli_value
+    return CONFIG[config_key]
 
 
 def main():
     args = parse_args()
     device = CONFIG['device']
     enable_cueq = CONFIG['enable_cueq'] or args.enable_cueq
+    lambda_energy = _resolve_lambda(args.lambda_energy, 'lambda_energy')
+    lambda_force_atom = _resolve_lambda(args.lambda_force_atom, 'lambda_force_atom')
+    lambda_force_mol = _resolve_lambda(args.lambda_force_mol, 'lambda_force_mol')
+
+    print(
+        f"Loss weights: lambda_energy={lambda_energy}, "
+        f"lambda_force_atom={lambda_force_atom}, "
+        f"lambda_force_mol={lambda_force_mol}"
+    )
 
     # 1. Load frozen MACE backbone
     extractor = load_mace(
@@ -163,9 +194,9 @@ def main():
         scheduler_factor=CONFIG['scheduler_factor'],
         min_lr=CONFIG['min_lr'],
         gradient_clip_norm=CONFIG['gradient_clip_norm'],
-        lambda_energy=CONFIG['lambda_energy'],
-        lambda_force_atom=CONFIG['lambda_force_atom'],
-        lambda_force_mol=CONFIG['lambda_force_mol'],
+        lambda_energy=lambda_energy,
+        lambda_force_atom=lambda_force_atom,
+        lambda_force_mol=lambda_force_mol,
         high_conf_cutoffs=CONFIG['high_conf_cutoffs'],
     )
 
