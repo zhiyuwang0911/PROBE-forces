@@ -33,6 +33,7 @@ PROBE/
 ├── train_aimnet2.py        # runnable training script for AIMNet2
 ├── train_mace.py           # runnable training script for MACE (energy only)
 ├── train_mace_multitask.py # runnable training script for MACE (energy + force)
+├── infer_mace_multitask.py # inference for multitask checkpoint + test.xyz
 ├── environment_aimnet2.yml
 └── environment_mace.yml
 ```
@@ -206,7 +207,20 @@ No other changes are needed.
 
 ---
 
+## Inference (multitask energy + force)
+
+```bash
+python infer_mace_multitask.py \
+  --mace-model /path/to/MACE-OFF23_large.model \
+  --checkpoint /path/to/best_multitask_model_YYYYMMDD_HHMMSS.pt \
+  --test-xyz /path/to/test.xyz \
+  --output-dir ./probe_multitask_inference
+```
+
+Writes `predictions_structure.csv`, `predictions_atom.csv`, `predictions.npz`, and `metrics.json` (if reference labels are present).
+
 ## Inference and Atom Importance
+
 
 ```python
 import torch
