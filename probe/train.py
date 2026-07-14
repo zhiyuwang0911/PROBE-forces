@@ -518,10 +518,13 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
                            lambda_energy=1.0, lambda_force_atom=1.0,
                            lambda_force_mol=1.0,
                            class_weights=None, label_smoothing=0.0,
-                           high_conf_cutoffs: Optional[Dict] = None) -> dict:
-    """Full multitask training loop with validation and early stopping."""
+                           high_conf_cutoffs: Optional[Dict] = None,
+                           resume_path: Optional[str] = None,
+                           checkpoint_every: int = 1) -> dict:
+    """Full multitask training with best + periodic last checkpoints and resume."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    last_ckpt_path = output_dir / 'last_checkpoint.pt'
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor,
@@ -537,8 +540,33 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         'val_acc_energy': [], 'val_acc_force_atom': [], 'val_acc_force_mol': [],
     }
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    start_epoch = 1
 
-    for epoch in range(1, epochs + 1):
+    if resume_path:
+        resume_path = Path(resume_path)
+        print(f"Resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        best_val_loss = float(ckpt.get('best_val_loss', float('inf')))
+        best_epoch = int(ckpt.get('best_epoch', 0))
+        patience_ctr = int(ckpt.get('patience_ctr', 0))
+        if ckpt.get('best_state') is not None:
+            best_state = ckpt['best_state']
+        if ckpt.get('history'):
+            history = ckpt['history']
+        if ckpt.get('timestamp'):
+            timestamp = ckpt['timestamp']
+        start_epoch = int(ckpt.get('epoch', 0)) + 1
+        print(f"Resume: next epoch={start_epoch}, best_epoch={best_epoch}, "
+              f"best_val_loss={best_val_loss:.4f}, patience={patience_ctr}")
+
+    checkpoint_every = max(1, int(checkpoint_every))
+
+    for epoch in range(start_epoch, epochs + 1):
         train_losses = train_epoch_multitask(
             model, process_batch_fn, train_loader, optimizer,
             error_bins_e, error_bins_f_atom, error_bins_f_mol, device,
@@ -586,7 +614,10 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
                 'model_state_dict': best_state,
                 'epoch': epoch,
                 'val_loss': val_loss,
-                'val_metrics': val_results,
+                'val_metrics': {
+                    k: v for k, v in val_results.items()
+                    if k in ('loss', 'accuracy', 'mcc', 'f1')
+                },
                 'error_bins_energy': error_bins_e.cpu().tolist(),
                 'error_bins_force_atom': error_bins_f_atom.cpu().tolist(),
                 'error_bins_force_mol': error_bins_f_mol.cpu().tolist(),
@@ -594,12 +625,35 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
                 'lambda_force_atom': lambda_force_atom,
                 'lambda_force_mol': lambda_force_mol,
             }, ckpt_path)
+            print(f"  saved best → {ckpt_path}")
         else:
             patience_ctr += 1
-            if patience_ctr >= early_stopping_patience:
-                print(f"Early stopping at epoch {epoch} "
-                      f"(best epoch {best_epoch}, val_loss={best_val_loss:.4f})")
-                break
+
+        if epoch % checkpoint_every == 0 or patience_ctr >= early_stopping_patience:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch,
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'best_state': best_state,
+                'patience_ctr': patience_ctr,
+                'history': history,
+                'timestamp': timestamp,
+                'error_bins_energy': error_bins_e.cpu().tolist(),
+                'error_bins_force_atom': error_bins_f_atom.cpu().tolist(),
+                'error_bins_force_mol': error_bins_f_mol.cpu().tolist(),
+                'lambda_energy': lambda_energy,
+                'lambda_force_atom': lambda_force_atom,
+                'lambda_force_mol': lambda_force_mol,
+            }, last_ckpt_path)
+            print(f"  saved last → {last_ckpt_path}")
+
+        if patience_ctr >= early_stopping_patience:
+            print(f"Early stopping at epoch {epoch} "
+                  f"(best epoch {best_epoch}, val_loss={best_val_loss:.4f})")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)

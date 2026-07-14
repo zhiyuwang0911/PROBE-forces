@@ -11,9 +11,11 @@ Edit the CONFIG block below, then run:
     python train_mace_multitask.py
     python train_mace_multitask.py --enable-cueq   # NVIDIA CUDA acceleration
     python train_mace_multitask.py --lambda-energy 1.0 --lambda-force-atom 1.0 --lambda-force-mol 0.3
+    python train_mace_multitask.py --resume        # continue from output_dir/last_checkpoint.pt
 """
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -65,6 +67,7 @@ CONFIG = {
     'scheduler_factor':        0.9,
     'min_lr':            5e-6,
     'gradient_clip_norm':1.0,
+    'checkpoint_every':  1,   # write last_checkpoint.pt every N epochs
 
     # Architecture (backbone_dim auto-detected from MACE)
     'atom_encoder_hidden':       [256, 128],
@@ -101,6 +104,16 @@ def parse_args():
         help='Loss weight for structure-level force reliability '
              '(default: CONFIG lambda_force_mol)',
     )
+    parser.add_argument(
+        '--resume', nargs='?', const='AUTO', default=None,
+        help='Resume training. With no path, uses '
+             'CONFIG[output_dir]/last_checkpoint.pt',
+    )
+    parser.add_argument(
+        '--checkpoint-every', type=int, default=None,
+        help='Save last_checkpoint.pt every N epochs '
+             '(default: CONFIG checkpoint_every)',
+    )
     return parser.parse_args()
 
 
@@ -118,6 +131,16 @@ def main():
     lambda_energy = _resolve_lambda(args.lambda_energy, 'lambda_energy')
     lambda_force_atom = _resolve_lambda(args.lambda_force_atom, 'lambda_force_atom')
     lambda_force_mol = _resolve_lambda(args.lambda_force_mol, 'lambda_force_mol')
+    checkpoint_every = (args.checkpoint_every
+                        if args.checkpoint_every is not None
+                        else CONFIG.get('checkpoint_every', 1))
+
+    resume_path = None
+    if args.resume is not None:
+        resume_path = (Path(CONFIG['output_dir']) / 'last_checkpoint.pt'
+                       if args.resume == 'AUTO' else Path(args.resume))
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
 
     print(
         f"Loss weights: lambda_energy={lambda_energy}, "
@@ -138,26 +161,39 @@ def main():
         CONFIG['batch_size'], CONFIG['valid_fraction'],
     )
 
-    # 3. Energy boundary from training set (live MACE predictions)
-    print("Computing energy error distribution on training set...")
-    errors_kcal = []
-    for batch in tqdm(train_loader, desc='Scanning energy errors'):
-        _, _, pred_e, true_e, _ = process_batch_mace(batch, device, extractor)
-        err = torch.abs(true_e - pred_e)
-        valid = ~torch.isnan(err)
-        errors_kcal.extend((err[valid].cpu().numpy() * CONFIG['ev_to_kcalmol']).tolist())
+    # 3–4. Error boundaries (skip full MACE scans when resuming)
+    if resume_path is not None:
+        print(f"Loading error bins from resume checkpoint {resume_path}")
+        resume_ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
+        error_bins_e = torch.tensor(
+            resume_ckpt['error_bins_energy'], device=device, dtype=torch.float32)
+        error_bins_f_atom = torch.tensor(
+            resume_ckpt['error_bins_force_atom'], device=device, dtype=torch.float32)
+        error_bins_f_mol = torch.tensor(
+            resume_ckpt['error_bins_force_mol'], device=device, dtype=torch.float32)
+        print(f"  energy bins={error_bins_e.tolist()}")
+        print(f"  force_atom bins={error_bins_f_atom.tolist()}")
+        print(f"  force_mol bins={error_bins_f_mol.tolist()}")
+    else:
+        print("Computing energy error distribution on training set...")
+        errors_kcal = []
+        for batch in tqdm(train_loader, desc='Scanning energy errors'):
+            _, _, pred_e, true_e, _ = process_batch_mace(batch, device, extractor)
+            err = torch.abs(true_e - pred_e)
+            valid = ~torch.isnan(err)
+            errors_kcal.extend(
+                (err[valid].cpu().numpy() * CONFIG['ev_to_kcalmol']).tolist())
 
-    boundary_kcal = compute_error_boundary(
-        np.array(errors_kcal), CONFIG['error_boundary_percentile'])
-    boundary_ev = boundary_kcal / CONFIG['ev_to_kcalmol']
-    error_bins_e = torch.tensor([0.0, boundary_ev], device=device)
+        boundary_kcal = compute_error_boundary(
+            np.array(errors_kcal), CONFIG['error_boundary_percentile'])
+        boundary_ev = boundary_kcal / CONFIG['ev_to_kcalmol']
+        error_bins_e = torch.tensor([0.0, boundary_ev], device=device)
 
-    # 4. Force boundaries from training set (per-atom + mean-atom structure)
-    print("Computing force error distribution on training set...")
-    boundary_f_atom, boundary_f_mol = scan_force_error_boundaries(
-        train_loader, device, extractor, CONFIG['error_boundary_percentile'])
-    error_bins_f_atom = torch.tensor([0.0, boundary_f_atom], device=device)
-    error_bins_f_mol  = torch.tensor([0.0, boundary_f_mol], device=device)
+        print("Computing force error distribution on training set...")
+        boundary_f_atom, boundary_f_mol = scan_force_error_boundaries(
+            train_loader, device, extractor, CONFIG['error_boundary_percentile'])
+        error_bins_f_atom = torch.tensor([0.0, boundary_f_atom], device=device)
+        error_bins_f_mol  = torch.tensor([0.0, boundary_f_mol], device=device)
 
     # 5. Build multitask PROBE model
     model = MultitaskPROBEModel(
@@ -198,6 +234,8 @@ def main():
         lambda_force_atom=lambda_force_atom,
         lambda_force_mol=lambda_force_mol,
         high_conf_cutoffs=CONFIG['high_conf_cutoffs'],
+        resume_path=str(resume_path) if resume_path else None,
+        checkpoint_every=checkpoint_every,
     )
 
     print(f"\nTraining complete. Best epoch: {history['best_epoch']}")
