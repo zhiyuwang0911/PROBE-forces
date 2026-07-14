@@ -136,13 +136,17 @@ force task is easier or redundant. Train and validation loss use the same
 weighted sum for direct comparison.
 
 The best checkpoint is saved to `output_dir/best_multitask_model_<timestamp>.pt`.
-Every epoch also writes `output_dir/last_checkpoint.pt` (model + optimizer +
-scheduler + history) for HPC walltime recovery. Resume without re-scanning
-error boundaries:
+Every epoch writes two resumable files:
+- `output_dir/checkpoint_epoch_XXXX.pt` — per-epoch snapshot
+- `output_dir/last_checkpoint.pt` — always the latest (overwrite)
+
+Also `best_multitask_model_<timestamp>.pt` when validation improves.
+
+Resume without re-scanning error boundaries:
 
 ```bash
 python train_mace_multitask.py --resume
-python train_mace_multitask.py --resume /path/to/last_checkpoint.pt --checkpoint-every 1
+python train_mace_multitask.py --resume ./outputs/checkpoint_epoch_0012.pt
 ```
 
 ### On AIMNet2

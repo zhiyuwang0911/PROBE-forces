@@ -564,8 +564,6 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         print(f"Resume: next epoch={start_epoch}, best_epoch={best_epoch}, "
               f"best_val_loss={best_val_loss:.4f}, patience={patience_ctr}")
 
-    checkpoint_every = max(1, int(checkpoint_every))
-
     for epoch in range(start_epoch, epochs + 1):
         train_losses = train_epoch_multitask(
             model, process_batch_fn, train_loader, optimizer,
@@ -629,26 +627,29 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         else:
             patience_ctr += 1
 
-        if epoch % checkpoint_every == 0 or patience_ctr >= early_stopping_patience:
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'epoch': epoch,
-                'best_val_loss': best_val_loss,
-                'best_epoch': best_epoch,
-                'best_state': best_state,
-                'patience_ctr': patience_ctr,
-                'history': history,
-                'timestamp': timestamp,
-                'error_bins_energy': error_bins_e.cpu().tolist(),
-                'error_bins_force_atom': error_bins_f_atom.cpu().tolist(),
-                'error_bins_force_mol': error_bins_f_mol.cpu().tolist(),
-                'lambda_energy': lambda_energy,
-                'lambda_force_atom': lambda_force_atom,
-                'lambda_force_mol': lambda_force_mol,
-            }, last_ckpt_path)
-            print(f"  saved last → {last_ckpt_path}")
+        # Always write a resumable checkpoint every epoch.
+        resumable = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'best_epoch': best_epoch,
+            'best_state': best_state,
+            'patience_ctr': patience_ctr,
+            'history': history,
+            'timestamp': timestamp,
+            'error_bins_energy': error_bins_e.cpu().tolist(),
+            'error_bins_force_atom': error_bins_f_atom.cpu().tolist(),
+            'error_bins_force_mol': error_bins_f_mol.cpu().tolist(),
+            'lambda_energy': lambda_energy,
+            'lambda_force_atom': lambda_force_atom,
+            'lambda_force_mol': lambda_force_mol,
+        }
+        epoch_ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pt'
+        torch.save(resumable, epoch_ckpt_path)
+        torch.save(resumable, last_ckpt_path)
+        print(f"  saved epoch → {epoch_ckpt_path.name}  |  last → {last_ckpt_path.name}")
 
         if patience_ctr >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch} "
