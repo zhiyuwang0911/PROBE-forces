@@ -32,6 +32,7 @@ dependencies:
     - ase
     - e3nn
     - mace-torch
+    - matplotlib
     - cuequivariance
     - cuequivariance-torch
     - cuequivariance-ops-torch-cu12

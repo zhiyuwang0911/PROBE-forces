@@ -27,6 +27,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm.auto import tqdm
 
 from .metrics import confusion_matrix_torch, compute_all_metrics
+from .plotting import update_training_curves
 
 
 def atomic_torch_save(obj, path) -> None:
@@ -311,10 +312,16 @@ def run_training(model, process_batch_fn: Callable,
             }, ckpt_path)
         else:
             patience_ctr += 1
-            if patience_ctr >= early_stopping_patience:
-                print(f"Early stopping at epoch {epoch} "
-                      f"(best epoch {best_epoch}, val_loss={best_val_loss:.4f})")
-                break
+
+        plot_path = update_training_curves(
+            history, output_dir, best_epoch=best_epoch or None)
+        if plot_path is not None and epoch == 1:
+            print(f"  training curves → {plot_path}")
+
+        if patience_ctr >= early_stopping_patience:
+            print(f"Early stopping at epoch {epoch} "
+                  f"(best epoch {best_epoch}, val_loss={best_val_loss:.4f})")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -685,6 +692,11 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         }
         save_resumable_checkpoint(
             resumable, output_dir, epoch, checkpoint_every=checkpoint_every)
+
+        plot_path = update_training_curves(
+            history, output_dir, best_epoch=best_epoch or None)
+        if plot_path is not None and epoch == start_epoch:
+            print(f"  training curves → {plot_path}")
 
         if patience_ctr >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch} "
