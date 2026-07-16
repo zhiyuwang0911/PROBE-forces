@@ -219,7 +219,8 @@ def train_val_split_loader(xyz_path: str, z_table, r_max: float,
     """Load XYZ and return (train_loader, val_loader).
 
     Uses probe.io_extxyz when ASE cannot parse reference energy/forces
-  from complex extxyz info lines. MACE predictions are always computed live.
+    from complex extxyz info lines. Each graph is tagged with ``structure_idx``
+    so MACE outputs can be cached across epochs.
     """
     import numpy as np
     from tqdm.auto import tqdm
@@ -238,6 +239,8 @@ def train_val_split_loader(xyz_path: str, z_table, r_max: float,
     for i, atoms in enumerate(tqdm(atoms_list, desc='Converting', leave=False)):
         try:
             d = atoms_to_atomic_data(atoms, z_table, r_max)
+            # Per-graph index for MACE result caching (batched → [B]).
+            d.structure_idx = torch.tensor([i], dtype=torch.long)
             (val_data if i in val_set else train_data).append(d)
         except Exception:
             pass
@@ -334,16 +337,152 @@ def process_batch_mace_multitask(batch, device: str,
     return process_batch_mace(batch, device, extractor, compute_force=True)
 
 
+def _pad_cached_structures(entries, true_energies, true_forces_list, device,
+                           compute_force: bool):
+    """Pad per-structure cache entries into a PROBE batch tuple."""
+    B = len(entries)
+    D = entries[0]['node_feats'].shape[1]
+    sizes = [e['node_feats'].shape[0] for e in entries]
+    N_max = max(sizes)
+
+    atom_feats = torch.zeros(B, N_max, D, device=device)
+    atom_mask = torch.zeros(B, N_max, dtype=torch.bool, device=device)
+    pred_energy = torch.empty(B, device=device)
+    true_energy = torch.empty(B, device=device)
+    pred_forces = true_forces = None
+    if compute_force:
+        pred_forces = torch.zeros(B, N_max, 3, device=device)
+        true_forces = torch.zeros(B, N_max, 3, device=device)
+
+    for i, entry in enumerate(entries):
+        n = sizes[i]
+        atom_feats[i, :n] = entry['node_feats'].to(device=device, dtype=torch.float32)
+        atom_mask[i, :n] = True
+        pred_energy[i] = entry['pred_energy'].to(device=device, dtype=torch.float32)
+        true_energy[i] = true_energies[i].to(device=device, dtype=torch.float32)
+        if compute_force:
+            pred_forces[i, :n] = entry['pred_forces'].to(
+                device=device, dtype=torch.float32)
+            true_forces[i, :n] = true_forces_list[i].to(
+                device=device, dtype=torch.float32)
+
+    n_atoms = atom_mask.sum(dim=1).float()
+    if compute_force:
+        return (atom_feats, atom_mask, pred_energy, true_energy,
+                pred_forces, true_forces, n_atoms)
+    return atom_feats, atom_mask, pred_energy, true_energy, n_atoms
+
+
+class CachedMACEProcessor:
+    """Run MACE once per structure, then reuse embeddings/preds every epoch.
+
+    First encounter (boundary scan or epoch 1) computes and stores CPU tensors
+    keyed by ``batch.structure_idx``. Later epochs only pad from cache.
+
+    Optional ``cache_dir`` persists entries as ``{structure_idx}.pt`` so
+    ``--resume`` can skip re-running MACE.
+    """
+
+    def __init__(self, extractor: MACEFeatureExtractor, compute_force: bool = True,
+                 cache_dir: str = None):
+        self.extractor = extractor
+        self.compute_force = compute_force
+        self._mem = {}
+        self.cache_dir = None
+        self.hits = 0
+        self.misses = 0
+        if cache_dir:
+            from pathlib import Path
+            self.cache_dir = Path(cache_dir)
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            n_disk = sum(1 for _ in self.cache_dir.glob('*.pt'))
+            if n_disk:
+                print(f"MACE cache dir {self.cache_dir}: {n_disk} entries on disk")
+
+    def _disk_path(self, sid: int):
+        return self.cache_dir / f'{sid}.pt'
+
+    def _load(self, sid: int):
+        if sid in self._mem:
+            return self._mem[sid]
+        if self.cache_dir is not None:
+            path = self._disk_path(sid)
+            if path.exists():
+                entry = torch.load(path, map_location='cpu', weights_only=False)
+                self._mem[sid] = entry
+                return entry
+        return None
+
+    def _store(self, sid: int, entry: dict):
+        self._mem[sid] = entry
+        if self.cache_dir is not None:
+            torch.save(entry, self._disk_path(sid))
+
+    def __len__(self):
+        return len(self._mem)
+
+    def __call__(self, batch, device: str):
+        if not hasattr(batch, 'structure_idx'):
+            return process_batch_mace(
+                batch, device, self.extractor, compute_force=self.compute_force)
+
+        ids = batch.structure_idx.detach().cpu().view(-1).tolist()
+        entries = [self._load(int(sid)) for sid in ids]
+        if all(e is not None for e in entries):
+            self.hits += len(ids)
+            ptr = batch.ptr
+            true_energies = []
+            true_forces_list = []
+            for i in range(len(ids)):
+                s, e = int(ptr[i]), int(ptr[i + 1])
+                true_energies.append(batch.energy[i].detach().cpu())
+                if self.compute_force:
+                    true_forces_list.append(batch.forces[s:e].detach().cpu())
+            return _pad_cached_structures(
+                entries, true_energies, true_forces_list, device,
+                self.compute_force)
+
+        self.misses += len(ids)
+        live = process_batch_mace(
+            batch, device, self.extractor, compute_force=self.compute_force)
+        if self.compute_force:
+            (atom_feats, atom_mask, pred_energy, true_energy,
+             pred_forces, true_forces, n_atoms) = live
+        else:
+            atom_feats, atom_mask, pred_energy, true_energy, n_atoms = live
+            pred_forces = true_forces = None
+
+        for i, sid in enumerate(ids):
+            sid = int(sid)
+            if self._load(sid) is not None:
+                continue
+            n = int(atom_mask[i].sum().item())
+            entry = {
+                'node_feats': atom_feats[i, :n].detach().cpu().contiguous(),
+                'pred_energy': pred_energy[i].detach().cpu(),
+            }
+            if self.compute_force:
+                entry['pred_forces'] = pred_forces[i, :n].detach().cpu().contiguous()
+            self._store(sid, entry)
+
+        return live
+
+
 def scan_force_error_boundaries(train_loader, device, extractor,
-                                percentile: float = 50):
+                                percentile: float = 50,
+                                process_batch_fn=None):
     """Scan training set and return (boundary_atom, boundary_mol) in eV/Å."""
     from ..labels import (atom_force_component_mae, structure_mean_force_error,
                           compute_percentile_boundary)
 
+    if process_batch_fn is None:
+        process_batch_fn = (
+            lambda batch, dev: process_batch_mace_multitask(batch, dev, extractor))
+
     atom_errors, struct_errors = [], []
     for batch in train_loader:
         (_, atom_mask, _, _, pred_forces, true_forces, _) = \
-            process_batch_mace_multitask(batch, device, extractor)
+            process_batch_fn(batch, device)
         atom_err = atom_force_component_mae(pred_forces, true_forces)
         struct_err = structure_mean_force_error(atom_err, atom_mask)
         mask = atom_mask.bool()

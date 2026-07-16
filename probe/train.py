@@ -15,6 +15,7 @@ and probe_mace.py for backend-specific implementations.
 from __future__ import annotations
 
 import copy
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, Optional
@@ -26,6 +27,43 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm.auto import tqdm
 
 from .metrics import confusion_matrix_torch, compute_all_metrics
+
+
+def atomic_torch_save(obj, path) -> None:
+    """Write a checkpoint via temp file + os.replace (safe on job TIMEOUT)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f'.tmp.{os.getpid()}')
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def save_resumable_checkpoint(resumable: dict, output_dir: Path,
+                              epoch: int, checkpoint_every: int = 0) -> Path:
+    """Always rewrite last_checkpoint.pt; optionally keep epoch-named copies.
+
+    Args:
+        checkpoint_every: 0 = only last_checkpoint.pt (recommended on HPG).
+            N > 0 also writes checkpoint_epoch_XXXX.pt every N epochs.
+    """
+    output_dir = Path(output_dir)
+    last_ckpt_path = output_dir / 'last_checkpoint.pt'
+    atomic_torch_save(resumable, last_ckpt_path)
+    if checkpoint_every and epoch % checkpoint_every == 0:
+        epoch_ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pt'
+        atomic_torch_save(resumable, epoch_ckpt_path)
+        print(f"  saved epoch → {epoch_ckpt_path.name}  |  "
+              f"rewrote → {last_ckpt_path.name}")
+    else:
+        print(f"  rewrote → {last_ckpt_path.name} (epoch {epoch})")
+    return last_ckpt_path
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +562,6 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
     """Full multitask training with best + periodic last checkpoints and resume."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    last_ckpt_path = output_dir / 'last_checkpoint.pt'
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=scheduler_factor,
@@ -627,7 +664,7 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
         else:
             patience_ctr += 1
 
-        # Always write a resumable checkpoint every epoch.
+        # Rewrite last_checkpoint.pt every epoch (atomic) for HPG TIMEOUT resume.
         resumable = {
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -646,10 +683,8 @@ def run_multitask_training(model, process_batch_fn, train_loader, val_loader,
             'lambda_force_atom': lambda_force_atom,
             'lambda_force_mol': lambda_force_mol,
         }
-        epoch_ckpt_path = output_dir / f'checkpoint_epoch_{epoch:04d}.pt'
-        torch.save(resumable, epoch_ckpt_path)
-        torch.save(resumable, last_ckpt_path)
-        print(f"  saved epoch → {epoch_ckpt_path.name}  |  last → {last_ckpt_path.name}")
+        save_resumable_checkpoint(
+            resumable, output_dir, epoch, checkpoint_every=checkpoint_every)
 
         if patience_ctr >= early_stopping_patience:
             print(f"Early stopping at epoch {epoch} "

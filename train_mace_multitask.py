@@ -12,6 +12,7 @@ Edit the CONFIG block below, then run:
     python train_mace_multitask.py --enable-cueq   # NVIDIA CUDA acceleration
     python train_mace_multitask.py --lambda-energy 1.0 --lambda-force-atom 1.0 --lambda-force-mol 0.3
     python train_mace_multitask.py --resume        # continue from output_dir/last_checkpoint.pt
+    python train_mace_multitask.py --cache-mace    # cache MACE after first pass (default on)
 """
 
 import argparse
@@ -25,8 +26,7 @@ from probe.model import MultitaskPROBEModel
 from probe.backends.mace import (
     load_mace, get_z_table,
     train_val_split_loader,
-    process_batch_mace,
-    process_batch_mace_multitask,
+    CachedMACEProcessor,
     scan_force_error_boundaries,
 )
 from probe.train import run_multitask_training, compute_error_boundary
@@ -67,7 +67,14 @@ CONFIG = {
     'scheduler_factor':        0.9,
     'min_lr':            5e-6,
     'gradient_clip_norm':1.0,
-    'checkpoint_every':  1,   # write last_checkpoint.pt every N epochs
+    # last_checkpoint.pt is always rewritten each epoch (for HPG TIMEOUT resume).
+    # checkpoint_every > 0 also keeps checkpoint_epoch_XXXX.pt every N epochs.
+    'checkpoint_every':  0,
+
+    # MACE cache: first pass fills RAM; later epochs reuse (no MACE).
+    # Set mace_cache_dir (or --mace-cache-dir) to also persist on disk for resume.
+    'cache_mace':        True,
+    'mace_cache_dir':    None,  # None = RAM only; path = also write {idx}.pt files
 
     # Architecture (backbone_dim auto-detected from MACE)
     'atom_encoder_hidden':       [256, 128],
@@ -111,8 +118,26 @@ def parse_args():
     )
     parser.add_argument(
         '--checkpoint-every', type=int, default=None,
-        help='Save last_checkpoint.pt every N epochs '
-             '(default: CONFIG checkpoint_every)',
+        help='Also keep checkpoint_epoch_XXXX.pt every N epochs '
+             '(0 = only rewrite last_checkpoint.pt each epoch; '
+             'default: CONFIG checkpoint_every)',
+    )
+    parser.add_argument(
+        '--cache-mace', action='store_true', default=None,
+        help='Cache MACE embeddings/preds after first pass (default: CONFIG)',
+    )
+    parser.add_argument(
+        '--no-cache-mace', action='store_true',
+        help='Disable MACE caching (recompute every epoch)',
+    )
+    parser.add_argument(
+        '--mace-cache-dir', type=str, default=None,
+        help='Also persist MACE cache to this directory for resume '
+             '(default: CONFIG mace_cache_dir, else RAM only)',
+    )
+    parser.add_argument(
+        '--output-dir', type=str, default=None,
+        help='Override CONFIG output_dir (checkpoints written here)',
     )
     return parser.parse_args()
 
@@ -126,6 +151,8 @@ def _resolve_lambda(cli_value, config_key: str) -> float:
 
 def main():
     args = parse_args()
+    if args.output_dir:
+        CONFIG['output_dir'] = args.output_dir
     device = CONFIG['device']
     enable_cueq = CONFIG['enable_cueq'] or args.enable_cueq
     lambda_energy = _resolve_lambda(args.lambda_energy, 'lambda_energy')
@@ -161,7 +188,28 @@ def main():
         CONFIG['batch_size'], CONFIG['valid_fraction'],
     )
 
-    # 3–4. Error boundaries (skip full MACE scans when resuming)
+    # 3. MACE processor (optional cache: fill on first pass, reuse later)
+    use_cache = CONFIG.get('cache_mace', True)
+    if args.no_cache_mace:
+        use_cache = False
+    elif args.cache_mace:
+        use_cache = True
+
+    if use_cache:
+        cache_dir = args.mace_cache_dir or CONFIG.get('mace_cache_dir')
+        if cache_dir:
+            print(f"MACE cache enabled (RAM + disk) → {cache_dir}")
+        else:
+            print("MACE cache enabled (RAM only; set --mace-cache-dir to persist)")
+        process_fn = CachedMACEProcessor(
+            extractor, compute_force=True, cache_dir=cache_dir)
+    else:
+        from probe.backends.mace import process_batch_mace_multitask
+        print("MACE cache disabled (recompute every epoch)")
+        process_fn = lambda batch, dev: process_batch_mace_multitask(
+            batch, dev, extractor)
+
+    # 4. Error boundaries (skip full MACE scans when resuming)
     if resume_path is not None:
         print(f"Loading error bins from resume checkpoint {resume_path}")
         resume_ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
@@ -175,10 +223,11 @@ def main():
         print(f"  force_atom bins={error_bins_f_atom.tolist()}")
         print(f"  force_mol bins={error_bins_f_mol.tolist()}")
     else:
-        print("Computing energy error distribution on training set...")
+        # Single train pass with forces fills energy+force bins and warms cache.
+        print("Computing energy + force error distributions on training set...")
         errors_kcal = []
         for batch in tqdm(train_loader, desc='Scanning energy errors'):
-            _, _, pred_e, true_e, _ = process_batch_mace(batch, device, extractor)
+            (_, _, pred_e, true_e, _, _, _) = process_fn(batch, device)
             err = torch.abs(true_e - pred_e)
             valid = ~torch.isnan(err)
             errors_kcal.extend(
@@ -191,9 +240,13 @@ def main():
 
         print("Computing force error distribution on training set...")
         boundary_f_atom, boundary_f_mol = scan_force_error_boundaries(
-            train_loader, device, extractor, CONFIG['error_boundary_percentile'])
+            train_loader, device, extractor, CONFIG['error_boundary_percentile'],
+            process_batch_fn=process_fn)
         error_bins_f_atom = torch.tensor([0.0, boundary_f_atom], device=device)
         error_bins_f_mol  = torch.tensor([0.0, boundary_f_mol], device=device)
+        if use_cache and isinstance(process_fn, CachedMACEProcessor):
+            print(f"  MACE cache after boundary scan: {len(process_fn)} structures "
+                  f"(hits={process_fn.hits}, misses={process_fn.misses})")
 
     # 5. Build multitask PROBE model
     model = MultitaskPROBEModel(
@@ -210,8 +263,6 @@ def main():
     print(f"Multitask PROBE parameters: {total_params:,}")
 
     # 6. Train
-    process_fn = lambda batch, dev: process_batch_mace_multitask(
-        batch, dev, extractor)
     history = run_multitask_training(
         model=model,
         process_batch_fn=process_fn,
