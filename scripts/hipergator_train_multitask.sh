@@ -39,6 +39,10 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"   # e.g. --enable-cueq --lambda-force-mol 0.3
 cd "$REPO_DIR"
 mkdir -p "$OUTPUT_DIR"
 
+# Avoid nounset failures in conda activate.d MKL hooks (set -u).
+export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER:-LP64}"
+export MKL_THREADING_LAYER="${MKL_THREADING_LAYER:-GNU}"
+
 module purge
 module load conda
 # module load cuda/12.4.0   # uncomment if your env needs a CUDA module
