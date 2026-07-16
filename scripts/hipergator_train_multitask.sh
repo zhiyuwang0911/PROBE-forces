@@ -12,28 +12,47 @@
 #SBATCH --requeue
 #
 # HyperGator: auto-resume multitask PROBE after TIMEOUT / preemption.
-# Edit paths below, then:  sbatch scripts/hipergator_train_multitask.sh
 #
-# Training rewrites output_dir/last_checkpoint.pt after every epoch
-# (atomic replace). Re-submit the same job (or rely on --requeue) and
-# this script will call --resume automatically when that file exists.
+#   1. Edit CONDA_ENV / paths below
+#   2. sbatch scripts/hipergator_train_multitask.sh
+#
+# Re-submit the same job after TIMEOUT; if last_checkpoint.pt exists,
+# training resumes automatically.
 
 set -euo pipefail
 
 # ---- edit these ----
 REPO_DIR="${REPO_DIR:-$PWD}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_DIR}/probe_mace_multitask_outputs}"
-# Optional: persist MACE cache across jobs (recommended on HPG)
-# MACE_CACHE_DIR="${OUTPUT_DIR}/mace_cache"
+
+# Path to your conda env (HPG recommended: put env/bin on PATH)
+# Examples:
+#   CONDA_ENV=/blue/yourgroup/$USER/conda/envs/probe
+#   CONDA_ENV=/home/$USER/.conda/envs/probe
+CONDA_ENV="${CONDA_ENV:-/blue/yourgroup/$USER/conda/envs/probe}"
+
+# Optional: persist MACE cache across jobs (recommended)
+# export MACE_CACHE_DIR="${OUTPUT_DIR}/mace_cache"
 EXTRA_ARGS="${EXTRA_ARGS:-}"   # e.g. --enable-cueq --lambda-force-mol 0.3
 # --------------------
 
 cd "$REPO_DIR"
 mkdir -p "$OUTPUT_DIR"
 
-module load conda 2>/dev/null || true
-# module load cuda 2>/dev/null || true
-# conda activate your_env
+module purge
+module load conda
+# module load cuda/12.4.0   # uncomment if your env needs a CUDA module
+
+if [[ ! -d "${CONDA_ENV}/bin" ]]; then
+  echo "ERROR: CONDA_ENV bin not found: ${CONDA_ENV}/bin" >&2
+  echo "Set CONDA_ENV to your env path before sbatch." >&2
+  exit 1
+fi
+# UFRC best practice for jobs: prepend env/bin instead of conda activate
+export PATH="${CONDA_ENV}/bin:${PATH}"
+hash -r
+echo "[$(date)] Using python: $(which python)"
+python -V
 
 LAST_CKPT="${OUTPUT_DIR}/last_checkpoint.pt"
 
