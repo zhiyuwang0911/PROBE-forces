@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from probe.model import MultitaskPROBEModel
+from probe.pca import restore_model
 from probe.backends.mace import (
     load_mace,
     get_z_table,
@@ -179,7 +180,7 @@ def main():
     print(f"error_bins force_atom={bins_fa.tolist()}")
     print(f"error_bins force_mol={bins_fm.tolist()}")
 
-    model = MultitaskPROBEModel(
+    legacy_config = dict(
         backbone_dim=extractor.feat_dim,
         atom_encoder_hidden=args.atom_encoder_hidden,
         atom_encoder_output_dim=args.atom_encoder_output_dim,
@@ -187,8 +188,13 @@ def main():
         classifier_hidden=args.classifier_hidden,
         atom_force_head_hidden=args.atom_force_head_hidden,
         dropout=args.dropout,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    )
+    if ckpt.get('original_dim', extractor.feat_dim) != extractor.feat_dim:
+        raise ValueError('MACE feature dimension differs from checkpoint')
+    if ckpt.get('pca_dim') is not None and 'model_config' not in ckpt:
+        raise ValueError('PCA checkpoint missing model_config')
+    model = restore_model(MultitaskPROBEModel,
+        dict(ckpt, model_config=ckpt.get('model_config', legacy_config)), device)
     model.eval()
 
     loader = load_extxyz_dataloader(

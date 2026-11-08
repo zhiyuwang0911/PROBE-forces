@@ -258,3 +258,66 @@ MIT — see [LICENSE](LICENSE).
 This repository extends the original [PROBE](https://github.com/isayevlab/PROBE) code
 (Isayev Lab, Carnegie Mellon University). Multitask energy/force modifications are
 Copyright (c) 2026 Zhiyu Wang.
+
+## PCA for the multitask classifier
+
+The `train_mace_multitask.py` entry point supports optional dimensionality
+reduction of frozen MACE atomic embeddings before the shared multitask encoder.
+The energy reliability, per-atom force reliability and structure force reliability
+outputs retain their existing definitions and loss weights.
+
+Edit the paths and training settings in `CONFIG` as usual, then run:
+
+```bash
+python train_mace_multitask.py --pca-dim 32 --output-dir probe_multitask_pca32
+```
+
+Use `--pca-dim 8`, `32`, `64`, or another positive dimension no larger than the
+raw embedding width. Omitting the flag retains full-dimensional training.
+Each dimension requires a new training run; old full-dimensional weights cannot
+be used as PCA-trained weights.
+
+PCA fits only on valid training atoms (padding and nonfinite embeddings are
+excluded). Validation/test structures never fit the basis. The streaming
+float64 covariance fit needs more valid training atoms than retained components.
+`--pca-max-atoms 1000000` caps the fit to the first training atoms encountered,
+not a random sample. The MACE cache continues to hold raw embeddings.
+
+Best, last and periodic checkpoints save the architecture, raw feature width,
+PCA dimension, mean and components. Inference reconstructs the model and PCA
+automatically, including a nondefault architecture:
+
+```bash
+python infer_mace_multitask.py \
+  --mace-model /path/to/MACE-OFF23_large.model \
+  --checkpoint /path/to/probe_multitask_pca32/best_multitask_model_TIMESTAMP.pt \
+  --test-xyz /path/to/test.xyz \
+  --output-dir predictions_multitask_pca32
+```
+
+Use the same frozen MACE backbone as training. No inference PCA flag or separate
+PCA file is needed. Legacy checkpoints without architecture metadata still use
+the existing inference architecture arguments.
+
+Resume using the same CONFIG paths/data and training settings:
+
+```bash
+python train_mace_multitask.py --output-dir probe_multitask_pca32 --resume
+```
+
+Resume restores the saved PCA basis without refitting. `--pca-dim` may be omitted
+or must match the checkpoint. Omit `--pca-model` and `--pca-max-atoms` on resume.
+Legacy full-dimensional checkpoints remain resumable with their matching CONFIG
+architecture.
+
+To use shared coordinates across classifier/regressor experiments, supply
+`--pca-model shared_pca.pt --pca-dim 32`. The torch artifact contains `mean`
+(raw embedding width) and `components` (rows of PCA directions). Sklearn
+`.joblib`/`.pkl` PCA artifacts are supported with joblib installed. Load only
+trusted artifacts, fitted on training data allowed for both experiments. The first
+requested rows are used and embedded in the model checkpoint. Independently
+fitting PCA in separate runs may produce different coordinates.
+
+These PCA options apply to the multitask entry points. The legacy single-task
+scripts retain their existing behavior. Full GPU/MACE validation requires your
+pretrained backbone and dataset.
